@@ -247,6 +247,87 @@ app.get("/api/state", (req, res) => {
   });
 });
 
+// User Account Registration
+app.post("/api/users/register", (req, res) => {
+  const { nom, email, role, assocId, specialite, nomClasse } = req.body;
+  
+  if (!nom || !email || !role) {
+    return res.status(400).json({ error: "Champs obligatoires manquants." });
+  }
+
+  const db = loadDB();
+  
+  // Check if email already exists
+  if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+    return res.status(400).json({ error: "Cette adresse e-mail est déjà utilisée." });
+  }
+
+  let finalAssocId = assocId;
+
+  if (role === "teacher" && !finalAssocId) {
+    // Create teacher profile
+    const newId = `t-${Date.now()}`;
+    db.teachers.push({
+      id: newId,
+      nom,
+      specialite: specialite || "Général",
+      email,
+      disponibilites: ["Lundi-Matin", "Mardi-Matin", "Mercredi-Matin", "Jeudi-Matin", "Vendredi-Matin"]
+    });
+    finalAssocId = newId;
+  } else if (role === "student" && !finalAssocId) {
+    // Create a school class
+    const newId = `c-${Date.now()}`;
+    db.schoolClasses.push({
+      id: newId,
+      nom_classe: nomClasse || `Promo - ${nom}`,
+      niveau: "Licence 1",
+      effectif: 30
+    });
+    finalAssocId = newId;
+  }
+
+  const newUser: User = {
+    id: `u-${Date.now()}`,
+    nom,
+    email,
+    role,
+    assocId: finalAssocId
+  };
+
+  db.users.push(newUser);
+  saveDB(db);
+
+  res.json({
+    message: "Inscription réussie !",
+    user: newUser,
+    state: db,
+    conflicts: analyzeConflicts(db)
+  });
+});
+
+// User Password Recovery
+app.post("/api/users/forgot-password", (req, res) => {
+  const { email, role } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "L'adresse e-mail est requise." });
+  }
+
+  const db = loadDB();
+  const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.role === role);
+
+  if (!user) {
+    return res.status(404).json({ error: "Aucun compte trouvé avec cet e-mail pour ce rôle." });
+  }
+
+  const tempPass = `Pass-${Math.floor(1000 + Math.random() * 9000)}`;
+  res.json({
+    message: `Réinitialisation demandée d'e-mail académique pour ${user.nom}.`,
+    tempPassword: tempPass,
+    instructions: `Un e-mail de récupération académique simulé a été envoyé pour relier ${email}. Utilisez le mot de passe provisoire [ ${tempPass} ] pour vous connecter.`
+  });
+});
+
 // Update standard DB nodes (saving state directly)
 app.post("/api/state/reset", (req, res) => {
   saveDB(DEFAULT_DB);

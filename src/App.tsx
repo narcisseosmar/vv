@@ -11,6 +11,7 @@ import {
   X, Check, UserCheck, Shield, HelpCircle, Laptop, Landmark, ClipboardList,
   Eye, Calendar, BarChart3, ChevronRight, Settings, Info, Lock, Mail, LogIn, LogOut, Key
 } from "lucide-react";
+import { jsPDF } from "jspdf";
 import { 
   User, Classroom, Teacher, Subject, SchoolClass, Schedule, 
   ScheduleConflict, DBState, DayOfWeek, ClassroomType, UserRole
@@ -49,6 +50,25 @@ export default function App() {
   const [loginEmail, setLoginEmail] = useState<string>("");
   const [loginPassword, setLoginPassword] = useState<string>("");
 
+  // Auth view mode (login, register/signup, forgot password)
+  const [authMode, setAuthMode] = useState<"login" | "signup" | "forgot">("login");
+  
+  // Registration and Forgot state form fields
+  const [signupNom, setSignupNom] = useState<string>("");
+  const [signupEmail, setSignupEmail] = useState<string>("");
+  const [signupSpecialite, setSignupSpecialite] = useState<string>("");
+  const [signupNomClasse, setSignupNomClasse] = useState<string>("");
+  const [signupAssocId, setSignupAssocId] = useState<string>("");
+
+  // Custom confirmation modal configuration state
+  const [deleteConfirmModal, setDeleteConfirmModal] = useState<{
+    isOpen: boolean;
+    type: "classroom" | "subject" | "schedule";
+    id: string;
+    title: string;
+    details: string;
+  } | null>(null);
+
   // Default initial users for preloading/fallback login options
   const DEFAULT_USERS: User[] = useMemo(() => [
     { id: "u-admin", nom: "Adama Traoré (Admin)", email: "admin@smartschedule.edu", role: "admin" },
@@ -74,6 +94,8 @@ export default function App() {
   const [showTeacherModal, setShowTeacherModal] = useState(false);
   const [showSchoolClassModal, setShowSchoolClassModal] = useState(false);
   const [showSubjectModal, setShowSubjectModal] = useState(false);
+
+  const [dragOverCell, setDragOverCell] = useState<{ day: string; start: string } | null>(null);
 
   const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
 
@@ -241,15 +263,93 @@ export default function App() {
     }
   };
 
-  const handleDeleteClassroom = async (id: string) => {
-    if (!window.confirm("Supprimer cette salle effacera toutes ses affectations d'emploi du temps. Continuer ?")) return;
-    try {
-      await fetch(`/api/classrooms/${id}`, { method: "DELETE" });
-      await fetchState();
-      showToast("La salle et ses cours associés ont été supprimés.");
-    } catch (err) {
-      showToast("Erreur lors du retrait de la salle.", true);
+  const triggerDeleteConfirmation = (type: "classroom" | "subject" | "schedule", id: string) => {
+    let title = "";
+    let details = "";
+    
+    if (type === "classroom") {
+      const room = dbState.classrooms.find(r => r.id === id);
+      const roomName = room ? room.nom_salle : "Salle inconnue";
+      const linked = dbState.schedules.filter(s => s.salle_id === id);
+      
+      title = `Suppression de la salle : ${roomName}`;
+      if (linked.length > 0) {
+        details = `Attention: Cette salle est actuellement utilisée par ${linked.length} cours planifié(s). Supprimer cette salle supprimera automatiquement TOIS les cours associés ci-dessous de manière définitive:\n\n` + 
+          linked.map(s => {
+            const subj = dbState.subjects.find(m => m.id === s.matiere_id);
+            const cls = dbState.schoolClasses.find(c => c.id === s.classe_id);
+            return `• ${subj ? subj.nom_matiere : "Matière"} (${cls ? cls.nom_classe : "Classe"}) - ${s.jour} de ${s.heure_debut} à ${s.heure_fin}`;
+          }).join("\n");
+      } else {
+        details = "Aucune dépendance active trouvée. Cette salle peut être supprimée en toute sécurité sans impacter l'emploi du temps.";
+      }
+    } else if (type === "subject") {
+      const subj = dbState.subjects.find(s => s.id === id);
+      const subjName = subj ? subj.nom_matiere : "Matière inconnue";
+      const linked = dbState.schedules.filter(s => s.matiere_id === id);
+      
+      title = `Suppression de la matière : ${subjName}`;
+      if (linked.length > 0) {
+        details = `Attention: Cette matière est programmée sur ${linked.length} créneau(x) d'emploi du temps. Supprimer cette matière libérera ces créneaux en cascade:\n\n` +
+          linked.map(s => {
+            const cls = dbState.schoolClasses.find(c => c.id === s.classe_id);
+            return `• ${subjName} (${cls ? cls.nom_classe : "Classe"}) - ${s.jour} de ${s.heure_debut} à ${s.heure_fin}`;
+          }).join("\n");
+      } else {
+        details = "Cette matière n'est affectée à aucun créneau d'emploi du temps. Elle peut être supprimée en toute sécurité.";
+      }
+    } else if (type === "schedule") {
+      const slot = dbState.schedules.find(s => s.id === id);
+      if (slot) {
+        const subj = dbState.subjects.find(m => m.id === slot.matiere_id);
+        const cls = dbState.schoolClasses.find(c => c.id === slot.classe_id);
+        const t = dbState.teachers.find(p => p.id === slot.enseignant_id);
+        title = "Retrait du cours du planning";
+        details = `Vous êtes sur le point de retirer ce cours planifié:\n\n• Matière: ${subj ? subj.nom_matiere : "Matière inconnue"}\n• Classe: ${cls ? cls.nom_classe : "Classe inconnue"}\n• Enseignant: ${t ? t.nom : "Enseignant inconnu"}\n• Horaire: ${slot.jour} de ${slot.heure_debut} à ${slot.heure_fin}\n\nCette action libérera ce créneau dans la grille hebdomadaire.`;
+      } else {
+        title = "Retrait d'un cours";
+        details = "Voulez-vous libérer ce créneau d'emploi du temps ?";
+      }
     }
+    
+    setDeleteConfirmModal({
+      isOpen: true,
+      type,
+      id,
+      title,
+      details
+    });
+  };
+
+  const executeConfirmedDelete = async () => {
+    if (!deleteConfirmModal) return;
+    const { type, id } = deleteConfirmModal;
+    
+    try {
+      if (type === "classroom") {
+        await fetch(`/api/classrooms/${id}`, { method: "DELETE" });
+        await fetchState();
+        showToast("La salle et ses cours associés ont été supprimés.");
+      } else if (type === "subject") {
+        await fetch(`/api/subjects/${id}`, { method: "DELETE" });
+        await fetchState();
+        showToast("Matière retirée.");
+      } else if (type === "schedule") {
+        const res = await fetch(`/api/schedules/${id}`, { method: "DELETE" });
+        const data = await res.json();
+        setDbState(data.state);
+        setConflicts(data.conflicts);
+        showToast("Créneau libéré.");
+      }
+    } catch (err) {
+      showToast("Une erreur est survenue lors de la suppression.", true);
+    } finally {
+      setDeleteConfirmModal(null);
+    }
+  };
+
+  const handleDeleteClassroom = async (id: string) => {
+    triggerDeleteConfirmation("classroom", id);
   };
 
   // 2. TEACHER CRUD ACTIONS
@@ -351,14 +451,7 @@ export default function App() {
   };
 
   const handleDeleteSubject = async (id: string) => {
-    if (!window.confirm("Désactiver cette matière ?")) return;
-    try {
-      await fetch(`/api/subjects/${id}`, { method: "DELETE" });
-      await fetchState();
-      showToast("Matière retirée.");
-    } catch (err) {
-      showToast("Erreur.", true);
-    }
+    triggerDeleteConfirmation("subject", id);
   };
 
   // 5. SCHEDULE TIMESLOT APPOINTMENT CRUD
@@ -396,16 +489,7 @@ export default function App() {
   };
 
   const handleDeleteSchedule = async (id: string) => {
-    if (!window.confirm("Voulez-vous détacher ce cours de l'emploi du temps ?")) return;
-    try {
-      const res = await fetch(`/api/schedules/${id}`, { method: "DELETE" });
-      const data = await res.json();
-      setDbState(data.state);
-      setConflicts(data.conflicts);
-      showToast("Créneau libéré.");
-    } catch (err) {
-      showToast("Erreur.", true);
-    }
+    triggerDeleteConfirmation("schedule", id);
   };
 
 
@@ -477,6 +561,226 @@ export default function App() {
   // PDF or Printer preview triggering
   const handlePrint = () => {
     window.print();
+  };
+
+  const handleExportPDF = () => {
+    if (!calFilterTargetId || schedulesToDisplay.length === 0) {
+      showToast("Veuillez sélectionner une cible de filtre active (Classe, Enseignant, Salle) avec des cours programmés.", true);
+      return;
+    }
+
+    try {
+      const doc = new jsPDF();
+      
+      // Determine filter target name & details
+      let targetName = "";
+      let targetInfo = "";
+      if (calViewMode === "classe") {
+        const c = classesMap.get(calFilterTargetId);
+        targetName = c ? c.nom_classe : "Classe";
+        targetInfo = c ? `Niveau: ${c.niveau} • Effectif: ${c.effectif} élèves` : "";
+      } else if (calViewMode === "enseignant") {
+        const t = teachersMap.get(calFilterTargetId);
+        targetName = t ? t.nom : "Enseignant";
+        targetInfo = t ? `Spécialité: ${t.specialite} • E-mail: ${t.email}` : "";
+      } else {
+        const r = classroomsMap.get(calFilterTargetId);
+        targetName = r ? r.nom_salle : "Salle";
+        targetInfo = r ? `Capacité: ${r.capacity || r.capacite} places • Type: ${r.type}` : "";
+      }
+
+      // 1. Header design
+      doc.setFillColor(15, 23, 42); // slate 900
+      doc.rect(0, 0, 210, 40, "F");
+
+      // Title
+      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      doc.text("SMARTSCHEDULE - RAPPORT D'EMPLOI DU TEMPS", 15, 18);
+
+      // Subtitle indicator
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(200, 200, 255);
+      doc.text(`Filtre actif : Horaire Hebdomadaire par ${calViewMode.toUpperCase()}`, 15, 26);
+      doc.text(`Document académique officiel - Université & École`, 15, 32);
+
+      // Date of generation
+      const currentDate = new Date().toLocaleString("fr-FR");
+      doc.setTextColor(148, 163, 184); // slate 400
+      doc.setFontSize(8);
+      doc.text(`Généré le : ${currentDate}`, 150, 32);
+
+      // 2. Target info block
+      doc.setTextColor(15, 23, 42); // slate 900
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.text(`Cible : ${targetName.toUpperCase()}`, 15, 52);
+
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(9.5);
+      doc.setTextColor(100, 116, 139); // slate 500
+      doc.text(targetInfo, 15, 58);
+
+      // Horizontal line
+      doc.setDrawColor(226, 232, 240); // slate 200
+      doc.setLineWidth(0.5);
+      doc.line(15, 63, 195, 63);
+
+      // 3. Table Header
+      doc.setFillColor(79, 70, 229); // Indigo 600 header row
+      doc.rect(15, 70, 180, 8, "F");
+
+      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.5);
+      doc.text("JOUR", 18, 75);
+      doc.text("CRENEAU HORAIRE", 45, 75);
+      doc.text("MATIERE / COURS", 85, 75);
+      doc.text("SALLE / CLASSE / ENSEIGNANT", 135, 75);
+
+      // Chronological sort
+      const daysOrder = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
+      const sortedSchedules = [...schedulesToDisplay].sort((a, b) => {
+        const dayDiff = daysOrder.indexOf(a.jour) - daysOrder.indexOf(b.jour);
+        if (dayDiff !== 0) return dayDiff;
+        return a.heure_debut.localeCompare(b.heure_debut);
+      });
+
+      // 4. Rows
+      let y = 84;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+
+      sortedSchedules.forEach((slot, index) => {
+        // Page break safety
+        if (y > 275) {
+          doc.addPage();
+          // Redraw banner on new page
+          doc.setFillColor(15, 23, 42);
+          doc.rect(0, 0, 210, 20, "F");
+          doc.setTextColor(255, 255, 255);
+          doc.setFont("helvetica", "bold");
+          doc.setFontSize(10);
+          doc.text(`SMARTSCHEDULE - SUITE RAPPORT (${targetName})`, 15, 13);
+          
+          // Re-draw table header
+          doc.setFillColor(79, 70, 229);
+          doc.rect(15, 26, 180, 8, "F");
+          doc.setTextColor(255, 255, 255);
+          doc.setFont("helvetica", "bold");
+          doc.setFontSize(8.5);
+          doc.text("JOUR", 18, 31);
+          doc.text("CRENEAU HORAIRE", 45, 31);
+          doc.text("MATIERE / COURS", 85, 31);
+          doc.text("SALLE / CLASSE / ENSEIGNANT", 135, 31);
+
+          y = 40;
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(8);
+        }
+
+        // Row background striping
+        if (index % 2 === 0) {
+          doc.setFillColor(248, 250, 252); // slate 50
+          doc.rect(15, y - 5, 180, 8, "F");
+        }
+
+        // Draw data row
+        const m = subjectsMap.get(slot.matiere_id);
+        const subjName = m ? m.nom_matiere : "Cours inconnu";
+        const room = classroomsMap.get(slot.salle_id);
+        const roomStr = room ? room.nom_salle : "Salle";
+        const cls = classesMap.get(slot.classe_id);
+        const clsStr = cls ? cls.nom_classe : "Classe";
+        const teach = teachersMap.get(slot.enseignant_id);
+        const teachStr = teach ? teach.nom : "Enseignant";
+
+        // Build details string based on filter mode to avoid redundancy
+        let extraStr = "";
+        if (calViewMode === "classe") {
+          extraStr = `${roomStr} • Prof. ${teachStr}`;
+        } else if (calViewMode === "enseignant") {
+          extraStr = `${roomStr} • ${clsStr}`;
+        } else {
+          extraStr = `${clsStr} • Prof. ${teachStr}`;
+        }
+
+        doc.setTextColor(30, 41, 59); // slate 800
+        doc.setFont("helvetica", "bold");
+        doc.text(slot.jour, 18, y);
+        
+        doc.setFont("helvetica", "normal");
+        doc.text(`${slot.heure_debut} - ${slot.heure_fin}`, 45, y);
+        doc.text(subjName.substring(0, 24), 85, y);
+        doc.text(extraStr.substring(0, 36), 135, y);
+
+        // Underline separator
+        doc.setDrawColor(241, 245, 249); // slate 100
+        doc.line(15, y + 3, 195, y + 3);
+
+        y += 8;
+      });
+
+      // 5. Total items block
+      y += 5;
+      doc.setDrawColor(79, 70, 229); // Violet stroke
+      doc.setLineWidth(0.5);
+      doc.line(15, y, 195, y);
+      
+      y += 6;
+      doc.setTextColor(100, 116, 139);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.5);
+      doc.text(`Volume total hebdomadaire : ${sortedSchedules.length} cours planifiés`, 15, y);
+      
+      y += 5;
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(7.5);
+      doc.text("Note : Ce document fait foi d'emploi du temps officiel sous réserve de modifications par l'Administration de l'Établissement.", 15, y);
+
+      doc.save(`SmartSchedule_Rapport_${targetName.replace(/\s+/g, "_")}.pdf`);
+      showToast("Rapport PDF généré et téléchargé avec succès !");
+    } catch (err: any) {
+      console.error(err);
+      showToast("Erreur lors de la génération du rapport PDF.", true);
+    }
+  };
+
+  const handleDropCourse = async (schId: string, toDay: string, toStart: string, toEnd: string) => {
+    const sch = dbState.schedules.find(s => s.id === schId);
+    if (!sch) return;
+    
+    // Check if anything actually changed
+    if (sch.jour === toDay && sch.heure_debut === toStart) {
+      return;
+    }
+
+    const updatedFormData = {
+      ...sch,
+      jour: toDay,
+      heure_debut: toStart,
+      heure_fin: toEnd
+    };
+
+    try {
+      const res = await fetch(`/api/schedules/${schId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updatedFormData)
+      });
+      const data = await res.json();
+      if (data.error) {
+        showToast(data.error, true);
+        return;
+      }
+      setDbState(data.state);
+      setConflicts(data.conflicts);
+      showToast(`Cours déplacé avec succès au ${toDay} de ${toStart} à ${toEnd}.`);
+    } catch (err) {
+      showToast("Erreur de modification du planning lors de l'enregistrement du déplacement.", true);
+    }
   };
 
   // Synchronized list of valid logins for Admin, Enseignants and Étudiants
@@ -577,6 +881,89 @@ export default function App() {
     }
   };
 
+  const handleRegisterSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!signupNom || !signupEmail) {
+      showToast("Veuillez remplir les informations obligatoires.", true);
+      return;
+    }
+    try {
+      const res = await fetch("/api/users/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          nom: signupNom,
+          email: signupEmail,
+          role: loginRole,
+          assocId: signupAssocId,
+          specialite: signupSpecialite,
+          nomClasse: signupNomClasse
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.error || "Erreur lors de la création de compte.", true);
+        return;
+      }
+      // Success
+      setDbState(data.state);
+      setConflicts(data.conflicts);
+      setLoggedInUser(data.user);
+      setIsLoggedIn(true);
+      setCurrentUserRole(data.user.role);
+      
+      // Select corresponding ID for calendar focus
+      if (data.user.role === "teacher" && data.user.assocId) {
+        setSimSelectedTeacherId(data.user.assocId);
+        setCalViewMode("enseignant");
+        setCalFilterTargetId(data.user.assocId);
+      } else if (data.user.role === "student" && data.user.assocId) {
+        setSimSelectedClassId(data.user.assocId);
+        setCalViewMode("classe");
+        setCalFilterTargetId(data.user.assocId);
+      }
+      
+      showToast(`Création de compte réussie ! Bienvenue, ${data.user.nom}`);
+      setAuthMode("login");
+      // Reset signup fields
+      setSignupNom("");
+      setSignupEmail("");
+      setSignupSpecialite("");
+      setSignupNomClasse("");
+      setSignupAssocId("");
+    } catch (err) {
+      showToast("Erreur système lors de l'enregistrement.", true);
+    }
+  };
+
+  const handleForgotPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!signupEmail) {
+      showToast("Veuillez saisir votre adresse e-mail.", true);
+      return;
+    }
+    try {
+      const res = await fetch("/api/users/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: signupEmail, role: loginRole })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.error || "Compte introuvable.", true);
+        return;
+      }
+      
+      alert(data.instructions); 
+      showToast("Procédure de récupération académique déclenchée.");
+      setAuthMode("login");
+      setLoginEmail(signupEmail);
+      setSignupEmail("");
+    } catch (err) {
+      showToast("Erreur de communication avec le serveur.", true);
+    }
+  };
+
   const handleLogout = () => {
     setIsLoggedIn(false);
     setLoggedInUser(null);
@@ -666,86 +1053,260 @@ export default function App() {
             })}
           </div>
 
-          {/* List Profile Accounts section */}
-          <div className="mt-6 space-y-3">
-            <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block font-sans">
-              {loginRole === "admin" && "Compte Administrateur"}
-              {loginRole === "teacher" && "Enseignants enregistrés (Cliquez pour remplir)"}
-              {loginRole === "student" && "Classes d'élèves / Promos (Cliquez pour remplir)"}
-            </label>
-            
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[160px] overflow-y-auto custom-scrollbar pr-1">
-              {availableUsersForRole.map(user => {
-                const isSelected = loginEmail.toLowerCase() === user.email.toLowerCase();
-                return (
+          {/* List Profile Accounts section - LOGIN MODE ONLY */}
+          {authMode === "login" && (
+            <div className="mt-6 space-y-3">
+              <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block font-sans">
+                {loginRole === "admin" && "Compte Administrateur"}
+                {loginRole === "teacher" && "Enseignants enregistrés (Cliquez pour remplir)"}
+                {loginRole === "student" && "Classes d'élèves / Promos (Cliquez pour remplir)"}
+              </label>
+              
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[160px] overflow-y-auto custom-scrollbar pr-1">
+                {availableUsersForRole.map(user => {
+                  const isSelected = loginEmail.toLowerCase() === user.email.toLowerCase();
+                  return (
+                    <button
+                      key={user.id}
+                      type="button"
+                      onClick={() => {
+                        setLoginEmail(user.email);
+                        setLoginPassword("********");
+                      }}
+                      className={`p-3 text-left rounded-xl border transition-all flex items-center justify-between ${
+                        isSelected
+                          ? "bg-indigo-950/40 border-[#4f46e5]/80 text-white"
+                          : "bg-slate-950/30 border-slate-800/50 hover:border-slate-700/80 text-slate-300 hover:text-slate-100"
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-bold truncate">{user.nom}</p>
+                        <p className="text-[10px] text-slate-500 truncate mt-0.5">{user.email}</p>
+                      </div>
+                      {isSelected && (
+                        <Check className="w-4 h-4 text-indigo-400 ml-2 shrink-0 animate-scaleIn" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Actual Forms based on mode */}
+          {authMode === "login" && (
+            <form onSubmit={handleLoginSubmit} className="mt-6 space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Adresse E-mail scolaire</label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                    <Mail className="w-4 h-4 text-slate-500" />
+                  </span>
+                  <input
+                    type="email"
+                    value={loginEmail}
+                    onChange={(e) => setLoginEmail(e.target.value)}
+                    placeholder="nom@smartschedule.edu"
+                    className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Mot de passe</label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                    <Lock className="w-4 h-4 text-slate-500" />
+                  </span>
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="Saisissez votre mot de passe"
+                    className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors text-white"
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full mt-2 py-3 bg-[#4f46e5] hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-colors flex items-center justify-center space-x-2 uppercase tracking-wide cursor-pointer"
+              >
+                <LogIn className="w-4 h-4" />
+                <span>Se Connecter en tant que {loginRole === "admin" ? "Admin" : loginRole === "teacher" ? "Professeur" : "Étudiant"}</span>
+              </button>
+
+              {/* Navigation helpers for SignUp or ForgotPassword for student/teachers */}
+              {loginRole !== "admin" && (
+                <div className="flex items-center justify-between pt-2 px-1 text-xs text-indigo-400">
                   <button
-                    key={user.id}
                     type="button"
                     onClick={() => {
-                      setLoginEmail(user.email);
-                      setLoginPassword("********");
+                      setAuthMode("signup");
+                      setSignupNom("");
+                      setSignupEmail("");
+                      setSignupSpecialite("");
+                      setSignupNomClasse("");
+                      setSignupAssocId("");
                     }}
-                    className={`p-3 text-left rounded-xl border transition-all flex items-center justify-between ${
-                      isSelected
-                        ? "bg-indigo-950/40 border-[#4f46e5]/80 text-white"
-                        : "bg-slate-950/30 border-slate-800/50 hover:border-slate-700/80 text-slate-300 hover:text-slate-100"
-                    }`}
+                    className="hover:underline font-semibold cursor-pointer"
                   >
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs font-bold truncate">{user.nom}</p>
-                      <p className="text-[10px] text-slate-500 truncate mt-0.5">{user.email}</p>
-                    </div>
-                    {isSelected && (
-                      <Check className="w-4 h-4 text-indigo-400 ml-2 shrink-0 animate-scaleIn" />
-                    )}
+                    Créer un compte {loginRole === "teacher" ? "Enseignant" : "Étudiant"}
                   </button>
-                );
-              })}
-            </div>
-          </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode("forgot");
+                      setSignupEmail("");
+                    }}
+                    className="hover:underline font-medium cursor-pointer"
+                  >
+                    Mot de passe oublié ?
+                  </button>
+                </div>
+              )}
+            </form>
+          )}
 
-          {/* Actual Form */}
-          <form onSubmit={handleLoginSubmit} className="mt-6 space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-400 uppercase">Adresse E-mail scolaire</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                  <Mail className="w-4 h-4 text-slate-500" />
-                </span>
+          {authMode === "signup" && (
+            <form onSubmit={handleRegisterSubmit} className="mt-6 space-y-4">
+              <div className="mb-2 bg-indigo-950/20 border border-indigo-800/30 p-3 rounded-lg text-xs leading-relaxed text-indigo-200">
+                <span className="font-extrabold block">Rejoindre la plateforme • {loginRole === "teacher" ? "Professeur" : "Étudiant"}</span>
+                Inscrivez-vous pour obtenir votre espace d'accès en quelques clics.
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Nom Complet</label>
+                <input
+                  type="text"
+                  required
+                  value={signupNom}
+                  onChange={(e) => setSignupNom(e.target.value)}
+                  placeholder="Ex: Dr. Sarah Kone ou Karim Sylla"
+                  className="w-full text-xs px-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none text-white transition-colors"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Adresse E-mail académique</label>
                 <input
                   type="email"
-                  value={loginEmail}
-                  onChange={(e) => setLoginEmail(e.target.value)}
+                  required
+                  value={signupEmail}
+                  onChange={(e) => setSignupEmail(e.target.value)}
                   placeholder="nom@smartschedule.edu"
-                  className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors"
+                  className="w-full text-xs px-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none text-white transition-colors"
                 />
               </div>
-            </div>
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-400 uppercase">Mot de passe</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                  <Lock className="w-4 h-4 text-slate-500" />
-                </span>
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  placeholder="Saisissez votre mot de passe"
-                  className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors"
-                />
+              {loginRole === "teacher" && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-400 uppercase">Spécialité d'Enseignement</label>
+                  <input
+                    type="text"
+                    value={signupSpecialite}
+                    onChange={(e) => setSignupSpecialite(e.target.value)}
+                    placeholder="Ex: Intelligence Artificielle, Réseaux"
+                    className="w-full text-xs px-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none text-white transition-colors"
+                  />
+                </div>
+              )}
+
+              {loginRole === "student" && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-400 uppercase">Nom de votre classe / promotion</label>
+                  <input
+                    type="text"
+                    value={signupNomClasse}
+                    onChange={(e) => setSignupNomClasse(e.target.value)}
+                    placeholder="Ex: L1 Génie Logiciel"
+                    className="w-full text-xs px-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none text-white transition-colors"
+                  />
+                </div>
+              )}
+
+              {/* Linking helper with existing listings in cascade if user is already declared in DB */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Rattacher à une liaison existante (Optionnel)</label>
+                <select
+                  value={signupAssocId}
+                  onChange={(e) => setSignupAssocId(e.target.value)}
+                  className="w-full text-xs px-3 py-3 bg-slate-950 border border-slate-800 rounded-xl text-slate-200 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="">-- Créer un nouveau profil dans l'annuaire --</option>
+                  {loginRole === "teacher" ? (
+                    dbState.teachers.map(t => (
+                      <option key={t.id} value={t.id}>{t.nom} ({t.specialite})</option>
+                    ))
+                  ) : (
+                    dbState.schoolClasses.map(c => (
+                      <option key={c.id} value={c.id}>{c.nom_classe} ({c.niveau})</option>
+                    ))
+                  )}
+                </select>
               </div>
-            </div>
 
-            <button
-              type="submit"
-              className="w-full mt-2 py-3 bg-[#4f46e5] hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-colors flex items-center justify-center space-x-2 uppercase tracking-wide"
-            >
-              <LogIn className="w-4 h-4" />
-              <span>Se Connecter en tant que {loginRole === "admin" ? "Admin" : loginRole === "teacher" ? "Professeur" : "Étudiant"}</span>
-            </button>
-          </form>
+              <div className="pt-2 flex flex-col sm:flex-row gap-2">
+                <button
+                  type="submit"
+                  className="flex-1 py-3 bg-[#4f46e5] hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-colors flex items-center justify-center space-x-2 uppercase cursor-pointer"
+                >
+                  <UserCheck className="w-4 h-4" />
+                  <span>S'enregistrer</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthMode("login")}
+                  className="px-4 py-3 bg-slate-850 hover:bg-slate-800 text-slate-300 font-bold text-xs rounded-xl transition-colors border border-slate-700/60 cursor-pointer"
+                >
+                  Annuler
+                </button>
+              </div>
+            </form>
+          )}
+
+          {authMode === "forgot" && (
+            <form onSubmit={handleForgotPasswordSubmit} className="mt-6 space-y-4">
+              <div className="mb-2 bg-indigo-950/20 border border-indigo-800/30 p-3 rounded-lg text-xs leading-relaxed text-indigo-200">
+                <span className="font-extrabold block">Mot de Passe perdu</span>
+                Saisissez votre e-mail pour que le système vous génère un mot de passe temporaire académique sécurisé.
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-400 uppercase">Saisissez votre Adresse E-mail</label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                    <Mail className="w-4 h-4 text-slate-500" />
+                  </span>
+                  <input
+                    type="email"
+                    required
+                    value={signupEmail}
+                    onChange={(e) => setSignupEmail(e.target.value)}
+                    placeholder="nom@smartschedule.edu"
+                    className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none text-white transition-colors"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-2 flex flex-col sm:flex-row gap-2">
+                <button
+                  type="submit"
+                  className="flex-1 py-3 bg-[#4f46e5] hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-colors flex items-center justify-center space-x-2 uppercase cursor-pointer"
+                >
+                  <Key className="w-4 h-4" />
+                  <span>Obtenir mot de passe temporaire</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthMode("login")}
+                  className="px-4 py-3 bg-slate-850 hover:bg-slate-800 text-slate-300 font-bold text-xs rounded-xl transition-colors border border-slate-700/60 cursor-pointer"
+                >
+                  Annuler
+                </button>
+              </div>
+            </form>
+          )}
 
           {/* Simple information banner */}
           <p className="mt-6 text-[10px] text-slate-500 text-center leading-relaxed font-sans">
@@ -1229,10 +1790,18 @@ export default function App() {
                   <div className="flex items-center space-x-2">
                     <button
                       onClick={handlePrint}
-                      className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-lg transition-colors flex items-center gap-1.5"
+                      className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
                     >
                       <Printer className="w-3.5 h-3.5" />
                       Imprimer Planning
+                    </button>
+
+                    <button
+                      onClick={handleExportPDF}
+                      className="px-3.5 py-1.5 bg-[#4f46e5]/10 hover:bg-[#4f46e5]/20 text-[#4f46e5] font-bold text-xs rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Générer rapport PDF
                     </button>
                     
                     {currentUserRole === "admin" && (
@@ -1332,10 +1901,20 @@ export default function App() {
                               (s) => s.jour === day && s.heure_debut === slot.start
                             );
 
+                            const isDragOver = dragOverCell?.day === day && dragOverCell?.start === slot.start;
+
                             return (
                               <div 
                                 key={day} 
-                                className="p-2 min-h-[110px] bg-white hover:bg-slate-50/50 transition-colors relative grid-cell group"
+                                onDragOver={(e) => { if (currentUserRole === "admin") { e.preventDefault(); } }}
+                                onDragEnter={() => { if (currentUserRole === "admin") { setDragOverCell({ day, start: slot.start }); } }}
+                                onDragLeave={() => { if (currentUserRole === "admin") { setDragOverCell(null); } }}
+                                onDrop={(e) => { if (currentUserRole === "admin") { setDragOverCell(null); const valId = e.dataTransfer.getData("text/plain"); if (valId) { handleDropCourse(valId, day, slot.start, slot.end); } } }}
+                                className={`p-2 min-h-[110px] transition-all relative grid-cell group border ${
+                                  isDragOver 
+                                    ? "bg-indigo-50/70 border-dashed border-indigo-400 border-2" 
+                                    : "bg-white hover:bg-slate-50/50 border-slate-100"
+                                }`}
                               >
                                 {matches.length === 0 ? (
                                   currentUserRole === "admin" ? (
@@ -1376,9 +1955,20 @@ export default function App() {
                                       const hasWarning = itemConflicts.some(c => c.severity === "warning");
 
                                       return (
-                                        <div 
+                                        <motion.div 
+                                          layout
                                           key={sch.id} 
-                                          className={`rounded-lg p-2.5 h-full flex flex-col justify-between text-xs transition-shadow border-l-[3px] course-block ${
+                                          draggable={currentUserRole === "admin"}
+                                          onDragStart={(e) => {
+                                            if (currentUserRole === "admin") {
+                                              e.dataTransfer.setData("text/plain", sch.id);
+                                              e.dataTransfer.effectAllowed = "move";
+                                            }
+                                          }}
+                                          whileHover={currentUserRole === "admin" ? { scale: 1.015, rotate: 0.5 } : {}}
+                                          className={`rounded-lg p-2.5 h-full flex flex-col justify-between text-xs transition-shadow border-l-[3px] course-block select-none ${
+                                            currentUserRole === "admin" ? "cursor-grab active:cursor-grabbing hover:shadow-md" : ""
+                                          } ${
                                             isDoubleBooked 
                                               ? "bg-red-50 border-red-500 text-red-900 shadow-xs" 
                                               : hasWarning 
@@ -1457,7 +2047,7 @@ export default function App() {
                                               ))}
                                             </div>
                                           )}
-                                        </div>
+                                        </motion.div>
                                       );
                                     })}
                                   </div>
@@ -2361,6 +2951,54 @@ export default function App() {
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* Dynamic Custom Delete Confirmation Modal */}
+      {deleteConfirmModal?.isOpen && (
+        <div className="fixed inset-0 bg-slate-950/65 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 15 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            className="bg-white rounded-xl shadow-2xl border border-rose-100 max-w-lg w-full overflow-hidden text-left"
+          >
+            {/* Header / Warning color bar */}
+            <div className="bg-rose-50 border-b border-rose-100 p-4 flex items-center space-x-2 text-rose-700">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span className="font-extrabold text-xs text-rose-800 tracking-wider uppercase">⚠️ Attention : Suppression d'entité</span>
+            </div>
+            
+            <div className="p-6 space-y-4">
+              <h3 className="text-sm font-black text-slate-900 tracking-tight leading-snug">{deleteConfirmModal.title}</h3>
+              
+              <div className="bg-slate-50 border border-slate-200/60 p-4 rounded-xl max-h-[220px] overflow-y-auto">
+                <p className="text-xs text-slate-700 whitespace-pre-wrap font-mono leading-relaxed">
+                  {deleteConfirmModal.details}
+                </p>
+              </div>
+              
+              <p className="text-[10px] text-slate-400 font-medium font-sans">
+                Cette suppression est irréversible. Toutes les dépendances listées seront nettoyées du planning de l'établissement académique.
+              </p>
+            </div>
+            
+            <div className="bg-slate-50/60 p-4 border-t border-slate-100 flex items-center justify-end space-x-2">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmModal(null)}
+                className="px-4 py-2 bg-slate-200 hover:bg-slate-300/80 text-slate-700 font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                onClick={executeConfirmedDelete}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white font-extrabold text-xs rounded-lg shadow-md transition-colors cursor-pointer flex items-center space-x-1"
+              >
+                <span>Confirmer la suppression</span>
+              </button>
+            </div>
+          </motion.div>
         </div>
       )}
 
