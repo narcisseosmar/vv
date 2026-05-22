@@ -9,7 +9,7 @@ import {
   Sparkles, RefreshCw, AlertCircle, FileText, CheckCircle2, Bot,
   Plus, Trash2, Edit2, Search, Filter, Printer, Download, BookOpen,
   X, Check, UserCheck, Shield, HelpCircle, Laptop, Landmark, ClipboardList,
-  Eye, Calendar, BarChart3, ChevronRight, Settings, Info
+  Eye, Calendar, BarChart3, ChevronRight, Settings, Info, Lock, Mail, LogIn, LogOut, Key
 } from "lucide-react";
 import { 
   User, Classroom, Teacher, Subject, SchoolClass, Schedule, 
@@ -39,6 +39,24 @@ export default function App() {
   // Simulated associated entity selector for teacher/student views
   const [simSelectedTeacherId, setSimSelectedTeacherId] = useState<string>("");
   const [simSelectedClassId, setSimSelectedClassId] = useState<string>("");
+
+  // Real authentication state for the user
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [loggedInUser, setLoggedInUser] = useState<User | null>(null);
+
+  // Login Form States
+  const [loginRole, setLoginRole] = useState<UserRole>("admin");
+  const [loginEmail, setLoginEmail] = useState<string>("");
+  const [loginPassword, setLoginPassword] = useState<string>("");
+
+  // Default initial users for preloading/fallback login options
+  const DEFAULT_USERS: User[] = useMemo(() => [
+    { id: "u-admin", nom: "Adama Traoré (Admin)", email: "admin@smartschedule.edu", role: "admin" },
+    { id: "u-t1", nom: "Dr. Jean Dupont", email: "jean.dupont@smartschedule.edu", role: "teacher", assocId: "t-1" },
+    { id: "u-t2", nom: "Mme. Marie Martin", email: "marie.martin@smartschedule.edu", role: "teacher", assocId: "t-2" },
+    { id: "u-t3", nom: "M. Thomas Bernhard", email: "thomas.bernhard@smartschedule.edu", role: "teacher", assocId: "t-3" },
+    { id: "u-s1", nom: "Amélie Kaboré (Étudiant L1)", email: "amelie@smartschedule.edu", role: "student", assocId: "c-1" },
+  ], []);
 
   // Search, filter & visual view configurations
   const [calViewMode, setCalViewMode] = useState<"classe" | "enseignant" | "salle">("classe");
@@ -461,6 +479,283 @@ export default function App() {
     window.print();
   };
 
+  // Synchronized list of valid logins for Admin, Enseignants and Étudiants
+  const availableUsersForRole = useMemo(() => {
+    const list = dbState.users && dbState.users.length > 0 ? dbState.users : DEFAULT_USERS;
+    const roleUsers = list.filter(u => u.role === loginRole);
+    
+    // Synthesize users from teachers list if not already present in the users table
+    if (loginRole === "teacher") {
+      const synthesized: User[] = [];
+      dbState.teachers.forEach(t => {
+        const alreadyExists = roleUsers.some(u => u.assocId === t.id || u.email.toLowerCase() === t.email.toLowerCase());
+        if (!alreadyExists) {
+          synthesized.push({
+            id: `u-synth-${t.id}`,
+            nom: t.nom,
+            email: t.email || `${t.nom.toLowerCase().replace(/\s+/g, ".")}@smartschedule.edu`,
+            role: "teacher",
+            assocId: t.id
+          });
+        }
+      });
+      return [...roleUsers, ...synthesized];
+    }
+    
+    // Synthesize users from classes list if not already present
+    if (loginRole === "student") {
+      const synthesized: User[] = [];
+      dbState.schoolClasses.forEach(c => {
+        const alreadyExists = roleUsers.some(u => u.assocId === c.id);
+        if (!alreadyExists) {
+          synthesized.push({
+            id: `u-synth-${c.id}`,
+            nom: `Délégué ${c.nom_classe}`,
+            email: `delegate.${c.id}@smartschedule.edu`,
+            role: "student",
+            assocId: c.id
+          });
+        }
+      });
+      return [...roleUsers, ...synthesized];
+    }
+    
+    return roleUsers;
+  }, [dbState.users, dbState.teachers, dbState.schoolClasses, loginRole, DEFAULT_USERS]);
+
+  const handleLoginSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginEmail) {
+      showToast("Veuillez sélectionner un profil ou entrer une adresse e-mail.", true);
+      return;
+    }
+
+    // Attempt matching email
+    const matchedUser = availableUsersForRole.find(
+      u => u.email.toLowerCase() === loginEmail.trim().toLowerCase()
+    );
+
+    if (matchedUser) {
+      setLoggedInUser(matchedUser);
+      setIsLoggedIn(true);
+      setCurrentUserRole(matchedUser.role);
+      
+      // Auto pre-select and view calendar of logged-in entity
+      if (matchedUser.role === "teacher" && matchedUser.assocId) {
+        setSimSelectedTeacherId(matchedUser.assocId);
+        setCalViewMode("enseignant");
+        setCalFilterTargetId(matchedUser.assocId);
+      } else if (matchedUser.role === "student" && matchedUser.assocId) {
+        setSimSelectedClassId(matchedUser.assocId);
+        setCalViewMode("classe");
+        setCalFilterTargetId(matchedUser.assocId);
+      } else if (matchedUser.role === "admin") {
+        setCalViewMode("classe");
+        if (dbState.schoolClasses.length > 0) {
+          setCalFilterTargetId(dbState.schoolClasses[0].id);
+        }
+      }
+      
+      showToast(`Connexion réussie ! Bienvenue, ${matchedUser.nom}.`);
+    } else {
+      // Dynamic test creation
+      if (loginEmail.includes("@")) {
+        const dynamicUser: User = {
+          id: `u-dyn-${Date.now()}`,
+          nom: loginEmail.split("@")[0].replace(/[._+]/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+          email: loginEmail,
+          role: loginRole,
+          assocId: loginRole === "teacher" ? (dbState.teachers[0]?.id || "") : (dbState.schoolClasses[0]?.id || "")
+        };
+        setLoggedInUser(dynamicUser);
+        setIsLoggedIn(true);
+        setCurrentUserRole(loginRole);
+        showToast(`Bienvenue (session démo), ${dynamicUser.nom}`);
+      } else {
+        showToast("E-mail non reconnu pour ce rôle. Sélectionnez un profil ou entrez un @email.", true);
+      }
+    }
+  };
+
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    setLoggedInUser(null);
+    setLoginEmail("");
+    setLoginPassword("");
+    showToast("Déconnexion réussie.");
+  };
+
+  if (!isLoggedIn) {
+    return (
+      <div className="flex min-h-screen w-screen bg-[#070a13] text-[#f1f5f9] items-center justify-center relative overflow-y-auto p-4 md:p-8 outline-none select-none antialiased font-sans">
+        {/* Ambient lighting lights - subtle and beautiful */}
+        <div className="absolute top-0 left-0 w-[500px] h-[500px] rounded-full bg-indigo-600/10 blur-[120px] pointer-events-none" />
+        <div className="absolute bottom-0 right-0 w-[500px] h-[500px] rounded-full bg-violet-600/10 blur-[120px] pointer-events-none" />
+
+        {/* Global Toasts contained */}
+        <AnimatePresence>
+          {errorMsg && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 p-4 bg-red-600 text-white rounded-xl shadow-lg flex items-center space-x-2 border border-red-500 max-w-lg text-sm"
+              style={{ contentVisibility: "auto" }}
+            >
+              <AlertCircle className="w-5 h-5 shrink-0" />
+              <span>{errorMsg}</span>
+              <button type="button" onClick={() => setErrorMsg(null)} className="ml-2 font-bold hover:text-red-100">✕</button>
+            </motion.div>
+          )}
+          {successMsg && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 p-4 bg-emerald-600 text-white rounded-xl shadow-lg flex items-center space-x-2 border border-emerald-500 max-w-lg text-sm"
+            >
+              <CheckCircle2 className="w-5 h-5 shrink-0" />
+              <span>{successMsg}</span>
+              <button type="button" onClick={() => setSuccessMsg(null)} className="ml-2 font-bold hover:text-emerald-100">✕</button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <motion.div 
+          initial={{ opacity: 0, y: 15 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4 }}
+          className="w-full max-w-xl bg-slate-900/80 border border-slate-800/80 rounded-2xl p-6 md:p-8 shadow-2xl relative z-10 backdrop-blur-md"
+        >
+          {/* Header */}
+          <div className="text-center space-y-2">
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-500 flex items-center justify-center text-white font-extrabold text-xl shadow-lg mx-auto">
+              S
+            </div>
+            <h2 className="text-2xl font-black tracking-tight text-white">SmartSchedule</h2>
+            <p className="text-xs text-slate-400 font-medium font-sans">Espace d'Authentification Académique Intégré</p>
+          </div>
+
+          {/* Role Tabs */}
+          <div className="grid grid-cols-3 gap-1 p-1 bg-slate-950/80 rounded-xl border border-slate-800/60 mt-6 shrink-0 text-center">
+            {[
+              { role: "admin", label: "Administration", icon: Shield },
+              { role: "teacher", label: "Enseignant", icon: Users },
+              { role: "student", label: "Étudiant", icon: GraduationCap }
+            ].map(item => {
+              const IconComp = item.icon;
+              const isSelected = loginRole === item.role;
+              return (
+                <button
+                  key={item.role}
+                  type="button"
+                  onClick={() => {
+                    setLoginRole(item.role as UserRole);
+                    setLoginEmail("");
+                  }}
+                  className={`flex flex-col items-center justify-center py-2.5 px-2 rounded-lg transition-all focus:outline-none ${
+                    isSelected 
+                      ? "bg-[#4f46e5] text-white font-bold shadow-md animate-scaleIn"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <IconComp className={`w-5 h-5 mb-1 ${isSelected ? "text-white" : "text-slate-400"}`} />
+                  <span className="text-[10px] uppercase font-bold tracking-wider">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* List Profile Accounts section */}
+          <div className="mt-6 space-y-3">
+            <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block font-sans">
+              {loginRole === "admin" && "Compte Administrateur"}
+              {loginRole === "teacher" && "Enseignants enregistrés (Cliquez pour remplir)"}
+              {loginRole === "student" && "Classes d'élèves / Promos (Cliquez pour remplir)"}
+            </label>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[160px] overflow-y-auto custom-scrollbar pr-1">
+              {availableUsersForRole.map(user => {
+                const isSelected = loginEmail.toLowerCase() === user.email.toLowerCase();
+                return (
+                  <button
+                    key={user.id}
+                    type="button"
+                    onClick={() => {
+                      setLoginEmail(user.email);
+                      setLoginPassword("********");
+                    }}
+                    className={`p-3 text-left rounded-xl border transition-all flex items-center justify-between ${
+                      isSelected
+                        ? "bg-indigo-950/40 border-[#4f46e5]/80 text-white"
+                        : "bg-slate-950/30 border-slate-800/50 hover:border-slate-700/80 text-slate-300 hover:text-slate-100"
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold truncate">{user.nom}</p>
+                      <p className="text-[10px] text-slate-500 truncate mt-0.5">{user.email}</p>
+                    </div>
+                    {isSelected && (
+                      <Check className="w-4 h-4 text-indigo-400 ml-2 shrink-0 animate-scaleIn" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Actual Form */}
+          <form onSubmit={handleLoginSubmit} className="mt-6 space-y-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-400 uppercase">Adresse E-mail scolaire</label>
+              <div className="relative">
+                <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                  <Mail className="w-4 h-4 text-slate-500" />
+                </span>
+                <input
+                  type="email"
+                  value={loginEmail}
+                  onChange={(e) => setLoginEmail(e.target.value)}
+                  placeholder="nom@smartschedule.edu"
+                  className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-400 uppercase">Mot de passe</label>
+              <div className="relative">
+                <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                  <Lock className="w-4 h-4 text-slate-500" />
+                </span>
+                <input
+                  type="password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="Saisissez votre mot de passe"
+                  className="w-full text-xs pl-10 pr-4 py-3 bg-slate-950/80 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition-colors"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              className="w-full mt-2 py-3 bg-[#4f46e5] hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-colors flex items-center justify-center space-x-2 uppercase tracking-wide"
+            >
+              <LogIn className="w-4 h-4" />
+              <span>Se Connecter en tant que {loginRole === "admin" ? "Admin" : loginRole === "teacher" ? "Professeur" : "Étudiant"}</span>
+            </button>
+          </form>
+
+          {/* Simple information banner */}
+          <p className="mt-6 text-[10px] text-slate-500 text-center leading-relaxed font-sans">
+            SmartSchedule est un système de gestion moderne. Les enseignants peuvent gérer leurs profils d'emploi du temps et les étudiants consulter l'agenda de leur filière.
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen w-screen bg-[#f8fafc] text-[#1e293b] overflow-hidden antialiased">
       {/* Toast Warnings */}
@@ -507,62 +802,64 @@ export default function App() {
           </div>
         </div>
 
-        {/* Live Simulator View Controls inside sidebar */}
-        <div className="px-5 py-4 border-b border-slate-800/80 bg-slate-900/60">
-          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1">
-            <Shield className="w-3 h-3 text-indigo-400" />
-            Mode de Simulation
-          </p>
-          <div className="grid grid-cols-3 gap-1 p-0.5 bg-slate-950 rounded-lg">
-            {(["admin", "teacher", "student"] as UserRole[]).map((r) => (
-              <button
-                key={r}
-                onClick={() => {
-                  setCurrentUserRole(r);
-                  showToast(`Rôle basculé sur : ${r === "admin" ? "Administrateur" : r === "teacher" ? "Enseignant" : "Étudiant"}`);
-                }}
-                className={`text-[10px] py-1.5 px-1 rounded font-medium capitalize transition-all ${
-                  currentUserRole === r 
-                    ? "bg-[#4f46e5] text-white font-bold shadow-xs" 
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                {r === "admin" ? "Admin" : r === "teacher" ? "Prof" : "Étu"}
-              </button>
-            ))}
+        {/* Live Simulator View Controls inside sidebar (Restricted to Admins) */}
+        {loggedInUser?.role === "admin" && (
+          <div className="px-5 py-4 border-b border-slate-800/80 bg-slate-900/60">
+            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <Shield className="w-3 h-3 text-indigo-400" />
+              Mode de Simulation
+            </p>
+            <div className="grid grid-cols-3 gap-1 p-0.5 bg-slate-950 rounded-lg">
+              {(["admin", "teacher", "student"] as UserRole[]).map((r) => (
+                <button
+                  key={r}
+                  onClick={() => {
+                    setCurrentUserRole(r);
+                    showToast(`Rôle basculé sur : ${r === "admin" ? "Administrateur" : r === "teacher" ? "Enseignant" : "Étudiant"}`);
+                  }}
+                  className={`text-[10px] py-1.5 px-1 rounded font-medium capitalize transition-all ${
+                    currentUserRole === r 
+                      ? "bg-[#4f46e5] text-white font-bold shadow-xs" 
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {r === "admin" ? "Admin" : r === "teacher" ? "Prof" : "Étu"}
+                </button>
+              ))}
+            </div>
+
+            {/* Context switches depending on selected role */}
+            {currentUserRole === "teacher" && dbState.teachers.length > 0 && (
+              <div className="mt-3 space-y-1">
+                <label className="text-[10px] text-indigo-300 block font-semibold">Consulter Enseignant :</label>
+                <select
+                  value={simSelectedTeacherId}
+                  onChange={(e) => setSimSelectedTeacherId(e.target.value)}
+                  className="w-full text-xs bg-slate-950 border border-slate-800 text-slate-100 rounded-md py-1 px-1.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                >
+                  {dbState.teachers.map(t => (
+                    <option key={t.id} value={t.id}>{t.nom}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {currentUserRole === "student" && dbState.schoolClasses.length > 0 && (
+              <div className="mt-3 space-y-1">
+                <label className="text-[10px] text-indigo-300 block font-semibold">Consulter Classe :</label>
+                <select
+                  value={simSelectedClassId}
+                  onChange={(e) => setSimSelectedClassId(e.target.value)}
+                  className="w-full text-xs bg-slate-950 border border-slate-800 text-slate-100 rounded-md py-1 px-1.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                >
+                  {dbState.schoolClasses.map(c => (
+                    <option key={c.id} value={c.id}>{c.nom_classe}</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
-
-          {/* Context switches depending on selected role */}
-          {currentUserRole === "teacher" && dbState.teachers.length > 0 && (
-            <div className="mt-3 space-y-1">
-              <label className="text-[10px] text-indigo-300 block font-semibold">Consulter Enseignant :</label>
-              <select
-                value={simSelectedTeacherId}
-                onChange={(e) => setSimSelectedTeacherId(e.target.value)}
-                className="w-full text-xs bg-slate-950 border border-slate-800 text-slate-100 rounded-md py-1 px-1.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
-              >
-                {dbState.teachers.map(t => (
-                  <option key={t.id} value={t.id}>{t.nom}</option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {currentUserRole === "student" && dbState.schoolClasses.length > 0 && (
-            <div className="mt-3 space-y-1">
-              <label className="text-[10px] text-indigo-300 block font-semibold">Consulter Classe :</label>
-              <select
-                value={simSelectedClassId}
-                onChange={(e) => setSimSelectedClassId(e.target.value)}
-                className="w-full text-xs bg-slate-950 border border-slate-800 text-slate-100 rounded-md py-1 px-1.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
-              >
-                {dbState.schoolClasses.map(c => (
-                  <option key={c.id} value={c.id}>{c.nom_classe}</option>
-                ))}
-              </select>
-            </div>
-          )}
-        </div>
+        )}
 
         {/* SIDEBAR NAVIGATION ITEMS */}
         <nav className="flex-1 px-4 py-4 space-y-1 overflow-y-auto custom-scrollbar nav-links">
@@ -657,32 +954,44 @@ export default function App() {
         </nav>
 
         {/* User profile footer */}
-        <div className="p-4 border-t border-slate-800 bg-slate-950/40 flex items-center space-x-3">
-          <div className="w-9 h-9 rounded-full bg-slate-800 overflow-hidden flex-shrink-0">
-            <img 
-              src={`https://ui-avatars.com/api/?name=${
-                currentUserRole === "admin" 
-                  ? "Adama+Traore" 
-                  : currentUserRole === "teacher" 
-                  ? "Jean+Dupont" 
-                  : "Amelie+Kabore"
-              }&background=4f46e5&color=fff`} 
-              alt="Avatar" 
-              className="w-full h-full object-cover"
-            />
+        <div className="p-4 border-t border-slate-800 bg-slate-950/40 flex items-center justify-between gap-2 overflow-hidden">
+          <div className="flex items-center space-x-3 min-w-0 flex-1">
+            <div className="w-9 h-9 rounded-full bg-slate-800 overflow-hidden flex-shrink-0 border border-slate-700">
+              <img 
+                src={`https://ui-avatars.com/api/?name=${encodeURIComponent(
+                  loggedInUser?.nom || (currentUserRole === "admin" 
+                    ? "Adama Traore" 
+                    : currentUserRole === "teacher" 
+                    ? "Jean Dupont" 
+                    : "Amelie Kabore")
+                )}&background=4f46e5&color=fff`} 
+                alt="Avatar" 
+                className="w-full h-full object-cover"
+              />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h5 className="text-xs font-bold text-slate-100 truncate">
+                {loggedInUser?.nom || (
+                  currentUserRole === "admin" 
+                    ? "Adama Traoré" 
+                    : currentUserRole === "teacher" 
+                    ? (teachersMap.get(simSelectedTeacherId)?.nom || "Dr. Jean Dupont")
+                    : "Amélie Kaboré"
+                )}
+              </h5>
+              <p className="text-[9px] text-slate-400 capitalize truncate font-sans font-medium tracking-tight">
+                {currentUserRole} • Connecté
+              </p>
+            </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <h5 className="text-xs font-semibold text-slate-100 truncate">
-              {currentUserRole === "admin" 
-                ? "Adama Traoré" 
-                : currentUserRole === "teacher" 
-                ? (teachersMap.get(simSelectedTeacherId)?.nom || "Dr. Jean Dupont")
-                : "Amélie Kaboré"}
-            </h5>
-            <p className="text-[10px] text-slate-400 capitalize truncate">
-              {currentUserRole} smartschedule
-            </p>
-          </div>
+          
+          <button
+            onClick={handleLogout}
+            title="Se déconnecter"
+            className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded-lg transition-all shrink-0"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </aside>
 
