@@ -1,0 +1,6 @@
+{
+  "name": "SmartSchedule",
+  "description": "Application intelligente et collaborative d'organisation d'emplois du temps, d’attribution automatique des salles et de gestion académique sans conflits.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
